@@ -1,0 +1,449 @@
+Лабораторная работа №11: Загрузка системы и управление службами systemd
+
+Введение
+
+В этой работе вы изучите процесс загрузки ОС Linux, работу загрузчика GRUB2, подсистему инициализации systemd, научитесь управлять службами, целевыми состояниями, контрольными группами (cgroups) и анализировать журналы. Все действия выполняются в терминале, часть команд требует прав суперпользователя.
+
+---
+
+Задание 1. Работа с загрузчиком GRUB2 и параметрами ядра
+
+Цель: изменить параметры загрузки, настроить GRUB и проанализировать сообщения ядра.
+
+1.1. Отключение «тихой» загрузки (quiet) при текущем запуске
+
+1. Перезагрузите виртуальную машину.
+2. При появлении меню GRUB нажмите клавишу e (edit), чтобы войти в режим редактирования команд запуска.
+3. Найдите строку, начинающуюся с linux. В ней есть параметр quiet (он скрывает большую часть сообщений ядра). Удалите слово quiet.
+4. Нажмите Ctrl+X или F10 для загрузки с изменёнными параметрами.
+5. После загрузки вы увидите подробные сообщения ядра на экране.
+
+📸 Скриншот 1: редактирование строки linux в GRUB.
+
+1.2. Постоянное отключение quiet и изменение тайм-аута GRUB
+
+Чтобы изменения сохранялись после перезагрузки, отредактируйте файл /etc/default/grub:
+
+```bash
+sudo nano /etc/default/grub
+```
+
+Найдите строку:
+
+```bash
+GRUB_CMDLINE_LINUX_DEFAULT="parsec.max_liev=63 quiet net.ifnames=0"
+```
+
+Удалите quiet. Также найдите строку GRUB_TIMEOUT=5 (или другую) и установите значение 7:
+
+```bash
+GRUB_TIMEOUT=7
+```
+
+Сохраните файл. Затем примените изменения командой:
+
+```bash
+sudo update-grub
+```
+
+После этого при каждой загрузке меню GRUB будет отображаться 7 секунд, а сообщения ядра будут выводиться на экран.
+
+📸 Скриншот 2: содержимое /etc/default/grub после изменений.
+
+1.3. Вывод целевого состояния по умолчанию и перезагрузка через systemd
+
+Текущее целевое состояние (target) по умолчанию можно посмотреть командой:
+
+```bash
+systemctl get-default
+```
+
+Обычно это graphical.target. Чтобы перезагрузить систему, используя systemd:
+
+```bash
+sudo systemctl isolate reboot.target
+```
+
+Или просто sudo reboot.
+
+📸 Скриншот 3: вывод systemctl get-default.
+
+1.4. Просмотр сообщений ядра от начала загрузки
+
+Команда dmesg выводит кольцевой буфер сообщений ядра. Для удобного просмотра:
+
+```bash
+dmesg | less
+```
+
+Или сохранить в файл:
+
+```bash
+dmesg > kernel_messages.txt
+```
+
+📸 Скриншот 4: фрагмент вывода dmesg.
+
+---
+
+Задание 2. Создание и управление пользовательскими службами systemd
+
+Цель: создать несколько служб, настроить их зависимости, проверить работу мониторинга нагрузки.
+
+2.1. Создание служб fly-message-monitor.service и resource-demanding1.service
+
+Если вы не создали их ранее при изучении материала, сделайте это по инструкции в лабораторной работе (стр. 29–33). Кратко:
+
+· Создайте скрипт /usr/local/bin/fly-message-monitor-sa (модифицированный fly-message-monitor).
+· Создайте файл /etc/systemd/system/fly-message-monitor.service с содержимым (см. стр. 29–30).
+· Создайте скрипт /usr/local/bin/resource-demanding1.sh:
+  ```bash
+  #!/bin/bash
+  /usr/bin/sha256sum /dev/urandom > /dev/null
+  ```
+  Сделайте его исполняемым: sudo chmod u+x /usr/local/bin/resource-demanding1.sh.
+· Создайте файл службы /etc/systemd/system/resource-demanding1.service:
+  ```ini
+  [Unit]
+  Description=Сервис, воспроизводящий высокую нагрузку на CPU
+  After=graphical.target
+  
+  [Service]
+  ExecStart=taskset 0x00000001 /usr/bin/bash /usr/local/bin/resource-demanding1.sh
+  Type=simple
+  
+  [Install]
+  WantedBy=graphical.target
+  ```
+· Для настройки контрольной группы создайте каталог /etc/systemd/system/resource-demanding1.service.d/ и файлы 00-slice.conf и 10-CPUSettings.conf (как на стр. 38).
+
+2.2. Создание службы resource-demanding2.service
+
+Скопируйте первый сервис, но измените:
+
+· Скрипт назовите resource-demanding2.sh (с тем же содержимым).
+· В строке ExecStart используйте taskset 0x00000002 (второй процессор, маска 2 в шестнадцатеричной системе).
+· Имя службы – resource-demanding2.service.
+
+📸 Скриншот 5: содержимое файла resource-demanding2.service.
+
+2.3. Создание скрипта мониторинга CPU cpu_usage.sh
+
+Создайте файл /usr/local/bin/cpu_usage.sh с содержимым из лабораторной работы (стр. 46–47). Обратите внимание, что в тексте есть синтаксические ошибки – приведём исправленный вариант (базовая логика):
+
+```bash
+#!/bin/bash
+CPU_THRESHOLD_WARNING=85
+CPU_THRESHOLD_CRITICAL=95
+CPU_THRESHOLD_PERIOD=5
+CPU_THRESHOLD_ITERATION=3
+MSG_FILE="/tmp/fly-msg/msg.txt"
+
+# Инициализация предыдущих значений
+cpu_last=()
+cpu_last_sum=0
+send_ok=0
+cpu_warning_count=0
+cpu_critical_count=0
+
+while :; do
+  # Читаем /proc/stat, первую строку "cpu"
+  read -r cpu_name cpu_user cpu_nice cpu_system cpu_idle cpu_iowait cpu_irq cpu_softirq cpu_steal cpu_guest cpu_guest_nice < /proc/stat
+  cpu_now=($cpu_user $cpu_nice $cpu_system $cpu_idle $cpu_iowait $cpu_irq $cpu_softirq $cpu_steal $cpu_guest $cpu_guest_nice)
+  cpu_sum=$((${cpu_now[@]/%/+}0))  # суммируем все значения
+  if [ $cpu_last_sum -eq 0 ]; then
+    cpu_last_sum=$cpu_sum
+    cpu_last=("${cpu_now[@]}")
+    sleep $CPU_THRESHOLD_PERIOD
+    continue
+  fi
+  cpu_delta=$((cpu_sum - cpu_last_sum))
+  cpu_idle_delta=$((cpu_now[3] - cpu_last[3]))
+  cpu_used=$((cpu_delta - cpu_idle_delta))
+  cpu_usage=$((100 * cpu_used / cpu_delta))
+
+  if [ $cpu_usage -ge $CPU_THRESHOLD_WARNING ]; then
+    ((cpu_warning_count++))
+    if [ $cpu_usage -ge $CPU_THRESHOLD_CRITICAL ]; then
+      ((cpu_critical_count++))
+    else
+      cpu_critical_count=0
+    fi
+  else
+    cpu_warning_count=0
+    cpu_critical_count=0
+  fi
+
+  msg_critical="critical\ndialog-warning\n<h1>Критическая нагрузка на CPU!</h1><p>Использование CPU $cpu_usage% $(date)</p>"
+  msg_warning="critical\ndialog-warning\n<h1>Высокая нагрузка на CPU!</h1><p>Использование CPU $cpu_usage% $(date)</p>"
+  msg_ok="normal\ndialog-information\n<h1>Нагрузка на CPU в пределах нормы</h1><p>Использование CPU $cpu_usage% $(date)</p>"
+
+  if [ $cpu_critical_count -ge $CPU_THRESHOLD_ITERATION ]; then
+    echo -en "$msg_critical" > $MSG_FILE
+    send_ok=1
+  elif [ $cpu_warning_count -ge $CPU_THRESHOLD_ITERATION ]; then
+    echo -en "$msg_warning" > $MSG_FILE
+    send_ok=1
+  elif [ $send_ok -eq 1 ]; then
+    echo -en "$msg_ok" > $MSG_FILE
+    send_ok=0
+  fi
+
+  cpu_last=("${cpu_now[@]}")
+  cpu_last_sum=$cpu_sum
+  sleep $CPU_THRESHOLD_PERIOD
+done
+```
+
+Сделайте файл исполняемым:
+
+```bash
+sudo chmod u+x /usr/local/bin/cpu_usage.sh
+```
+
+📸 Скриншот 6: содержимое скрипта cpu_usage.sh.
+
+2.4. Создание модуля службы cpu-monitor.service
+
+Создайте файл /etc/systemd/system/cpu-monitor.service:
+
+```ini
+[Unit]
+Description=Мониторинг нагрузки на CPU
+After=fly-message-monitor.service
+
+[Service]
+ExecStart=/usr/local/bin/cpu_usage.sh
+Type=simple
+
+[Install]
+WantedBy=graphical.target
+```
+
+2.5. Вывод содержимого модуля через systemctl
+
+```bash
+systemctl cat cpu-monitor.service
+```
+
+📸 Скриншот 7: вывод systemctl cat.
+
+2.6. Редактирование модуля, чтобы он запускался после fly-message-monitor.service
+
+Мы уже указали After= в файле. Если нужно добавить зависимость, можно также использовать systemctl edit:
+
+```bash
+sudo systemctl edit cpu-monitor.service
+```
+
+В открывшемся редакторе добавить:
+
+```ini
+[Unit]
+After=fly-message-monitor.service
+```
+
+Сохранить и выйти. Это создаст drop-in файл.
+
+2.7. Запуск службы и проверка статуса
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable cpu-monitor.service
+sudo systemctl start cpu-monitor.service
+systemctl status cpu-monitor.service
+```
+
+2.8. Переключение в multi-user.target
+
+```bash
+sudo systemctl isolate multi-user.target
+```
+
+После переключения графический интерфейс пропадёт, останется текстовый режим. Проверьте, что службы cpu-monitor.service и fly-message-monitor.service не запущены (они зависят от graphical.target):
+
+```bash
+systemctl status cpu-monitor.service
+systemctl status fly-message-monitor.service
+```
+
+2.9. Возврат в graphical.target
+
+```bash
+sudo systemctl isolate graphical.target
+```
+
+После загрузки графики проверьте, что службы запустились.
+
+2.10. Запуск ресурсоёмких служб
+
+```bash
+sudo systemctl start resource-demanding1.service
+sudo systemctl start resource-demanding2.service
+```
+
+2.11. Проверка получения уведомлений
+
+При нагрузке выше 85% скрипт cpu_usage.sh должен отправлять сообщения через fly-message-monitor.service. Убедитесь, что на рабочем столе появляются всплывающие уведомления.
+
+📸 Скриншот 8: уведомление о высокой нагрузке.
+
+---
+
+Задание 3. Настройка контрольных групп (cgroups) для ограничения CPU
+
+Цель: изменить параметры контрольной группы, чтобы ограничить потребление CPU службой resource-demanding1.service.
+
+3.1. Настройка для нагрузки 85–94%
+
+Создайте или отредактируйте drop-in файл для службы:
+
+```bash
+sudo mkdir -p /etc/systemd/system/resource-demanding1.service.d
+sudo nano /etc/systemd/system/resource-demanding1.service.d/10-CPUSettings.conf
+```
+
+Добавьте:
+
+```ini
+[Service]
+CPUQuota=90%
+```
+
+Это ограничит использование CPU для всей контрольной группы до 90% одного ядра (при двух ядрах суммарная нагрузка может быть распределена). Для более точного контроля используйте CPUWeight (для справедливого распределения) или CPUShares.
+Перечитайте конфигурацию и перезапустите службу:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart resource-demanding1.service
+```
+
+Проверьте нагрузку в htop – суммарное потребление двух процессов должно быть в пределах 85–94% от двух ядер.
+
+📸 Скриншот 9: htop с ограничением 90% на первый процесс.
+
+3.2. Настройка для нагрузки ниже 85%
+
+Измените CPUQuota на 50%:
+
+```ini
+CPUQuota=50%
+```
+
+После перезапуска убедитесь, что сообщения о высокой нагрузке перестали появляться (или появилось сообщение о нормализации).
+
+3.3. Вывод дерева контрольных групп
+
+```bash
+systemd-cgls
+```
+
+Найдите в выводе группу system.slice/resource-demanding1.service.
+
+📸 Скриншот 10: фрагмент systemd-cgls с нужной службой.
+
+---
+
+Задание 4. Управление модулями и журналами systemd
+
+Цель: научиться просматривать модули, журналы и управлять службами.
+
+4.1. Вывод всех запущенных модулей
+
+```bash
+systemctl
+```
+
+или
+
+```bash
+systemctl list-units
+```
+
+4.2. Вывод всех модулей служб
+
+```bash
+systemctl list-unit-files --type=service
+```
+
+4.3. Отслеживание событий в реальном времени
+
+```bash
+sudo journalctl -f
+```
+
+Для остановки нажмите Ctrl+C.
+
+4.4. Перезапуск службы и просмотр статуса
+
+```bash
+sudo systemctl restart resource-demanding1.service
+systemctl status resource-demanding1.service
+```
+
+4.5. Остановка служб
+
+```bash
+sudo systemctl stop resource-demanding1.service resource-demanding2.service cpu-monitoring.service
+```
+
+4.6. Вывод журнала службы в сокращённом виде
+
+```bash
+sudo journalctl -u resource-demanding1.service -o short
+```
+
+📸 Скриншот 11: вывод journalctl для службы.
+
+---
+
+Ответы на контрольные вопросы
+
+1. Какое сочетание технологий рекомендуется использовать в современных системах?
+      Ответ: UEFI + GPT (стр. 10: «Сейчас такой способ загрузки считается наиболее правильным и настоятельно рекомендуется всеми разработчиками операционных систем»).
+2. Расположите пункты запуска компьютера с ОС Linux от момента включения до момента запуска ядра в правильном порядке:
+      Ответ:
+      b. Тестирование и инициализация оборудования
+      c. Поиск загрузочного устройства
+      e. Запуск загрузчика первого этапа
+      g. Запуск загрузчика второго этапа
+      f. Вывод загрузочного меню
+      d. Загрузка ядра
+      (стр. 1–9, описано в процессе загрузки)
+3. Расположите пункты запуска компьютера с ОС Linux от момента запуска ядра до момента загрузки системы в выбранном целевом состоянии:
+      Ответ:
+      c. Инициализация наиболее важных функций ядра
+      b. Монтирование init ram fs в корень
+      a. Загрузка модулей ядра и драйверов с RAM-диска
+      f. Запуск скрипта /init
+      e. Монтирование устройства с системным диском в корень
+      d. Запуск процесса systemd
+      g. Запуск модулей systemd
+      (стр. 18–20)
+4. В каком файле следует выполнять настройки GRUB?
+      Ответ: В файле /etc/default/grub (стр. 15–16).
+5. Какая команда позволит применить новую конфигурацию GRUB?
+      Ответ: update-grub (или grub-mkconfig -o /boot/grub/grub.cfg) (стр. 16).
+6. Какого модуля systemd не существует?
+      Ответ: В тексте перечислены модули: .target, .service, .mount, .automount, .swap, .timer, .socket, .slice, .device, .path, .snapshot. Например, нет модуля .user (стр. 21–22). Наиболее явно не существует модуля, не упомянутого в списке.
+7. Какие целевые состояния ОС соответствуют следующим уровням загрузки?
+      A. runlevel 0 → poweroff.target
+      B. runlevel 1 → rescue.target
+      C. runlevel 2 → multi-user.target
+      D. runlevel 3 → multi-user.target
+      E. runlevel 4 → multi-user.target
+      F. runlevel 5 → graphical.target
+      G. runlevel 6 → reboot.target
+      (стр. 24)
+8. Какие секции могут присутствовать в конфигурационном файле модуля службы systemd:
+      Ответ: [Unit], [Service], [Install] (стр. 26).
+9. Какой командой можно отслеживать события со службами systemd в реальном времени?
+      Ответ: sudo journalctl -f (стр. 42).
+10. Какая команда выведет список всех служб и их состояния:
+        Ответ: systemctl list-unit-files --type=service (стр. 40).
+
+---
+
+Заключение
+
+Вы выполнили все задания: настроили загрузчик, отключили тихий режим, создали и управляли пользовательскими службами systemd, настроили контрольные группы для ограничения CPU, научились анализировать журналы. Эти навыки необходимы для администрирования загрузки и управления сервисами в Astra Linux.
